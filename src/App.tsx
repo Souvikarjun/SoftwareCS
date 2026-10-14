@@ -22,11 +22,15 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import {
+  simulateArchitectures,
+  type ArchitectureId,
+  type MarketTradeSample,
+  type SimulationConfig,
+  type SimulationRunResult,
+} from './simulation'
 import './App.css'
 
-type ArchitectureId = 'pipe' | 'microkernel' | 'layered' | 'shared'
-type SyncMode = 'mutex' | 'atomic' | 'hybrid'
-type OptimizationMode = 'baseline' | 'optimized'
 type MarketStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error'
 
 type LiveTrade = {
@@ -42,6 +46,7 @@ type MarketStats = {
   tradeCount: number
   totalShares: number
   eventsPerSecond: number
+  averageTradeSize: number
 }
 
 const architectureIds: ArchitectureId[] = ['pipe', 'microkernel', 'layered', 'shared']
@@ -94,10 +99,11 @@ const defaultConfig = {
   processingStages: 6,
   pluginCount: 5,
   pluginOverheadUs: 72,
+  pluginIsolation: 70,
   layerCount: 5,
-  syncMethod: 'hybrid' as SyncMode,
+  syncMethod: 'hybrid' as const,
   lockContention: 38,
-  optimizationMode: 'optimized' as OptimizationMode,
+  optimizationMode: 'optimized' as const,
   exchangeRoundTripUs: 160,
   networkJitterUs: 42,
   ackDelayUs: 85,
@@ -117,241 +123,14 @@ const defaultConfig = {
   } as Record<ArchitectureId, boolean>,
 }
 
-type Config = typeof defaultConfig
-
-const clamp = (value: number, min: number, max: number) =>
-  Math.min(max, Math.max(min, value))
-
-function computeArchitectureMetrics(config: Config, architecture: ArchitectureId, simulationRun: number) {
-  const feedPressure = config.exchangeFeeds * (config.marketEventsPerSecond / 100000)
-  const burstFactor = 1 + config.volatility / 100 + (simulationRun % 5) * 0.018
-  const networkLatency =
-    config.exchangeRoundTripUs +
-    config.networkJitterUs +
-    config.ackDelayUs +
-    config.packetLossPercent * 18
-  const failurePenalty =
-    config.exchangeFailureProbability * 1.8 +
-    config.workerFailureProbability * 1.3 +
-    config.pluginFailureProbability * 1.5 +
-    config.queueOverflowProbability * 1.9 +
-    config.feedDisconnectProbability * 1.5
-
-  switch (architecture) {
-    case 'pipe': {
-      const queuePenalty = Math.max(0, config.marketEventsPerSecond / config.queueCapacity - 180) * 0.65
-      const stagePenalty = (config.processingStages - 4) * 28
-      const internalUs =
-        config.averageProcessingUs * (1 + config.variabilityPercent / 120) +
-        queuePenalty +
-        stagePenalty +
-        feedPressure * 8 +
-        config.eventSizeKb * 22 +
-        14 * burstFactor
-
-      const endToEndUs = internalUs + networkLatency
-      const throughput =
-        (config.workerThreads * 145000) /
-        Math.max(250, internalUs) *
-        (1 - config.queueOverflowProbability / 100)
-      const reliability = clamp(
-        100 -
-          config.stageFailureProbability * 5.8 -
-          config.queueOverflowProbability * 4.2 -
-          config.feedDisconnectProbability * 2.3 -
-          failurePenalty,
-        32,
-        98,
-      )
-      const faultTolerance = clamp(
-        100 - config.queueOverflowProbability * 12 - config.stageFailureProbability * 11,
-        35,
-        96,
-      )
-      const scalability = clamp(
-        74 + config.workerThreads * 1.4 - config.exchangeFeeds * 0.9 + (config.optimizationMode === 'optimized' ? 10 : 0),
-        38,
-        95,
-      )
-      return {
-        internalUs,
-        endToEndUs,
-        throughput,
-        reliability,
-        faultTolerance,
-        scalability,
-        score: clamp(
-          52 + throughput / 2200 + reliability * 0.38 + scalability * 0.28 - endToEndUs / 38,
-          0,
-          100,
-        ),
-      }
-    }
-    case 'microkernel': {
-      const dispatchPenalty =
-        config.pluginCount * config.pluginOverheadUs +
-        config.pluginCount * 18 +
-        config.exchangeFeeds * 9
-      const internalUs =
-        config.averageProcessingUs * (1 + config.variabilityPercent / 140) +
-        dispatchPenalty +
-        feedPressure * 7 +
-        config.workerFailureProbability * 8 +
-        18 * burstFactor
-
-      const endToEndUs = internalUs + networkLatency + config.pluginFailureProbability * 4
-      const throughput =
-        (config.workerThreads * 130000) /
-        Math.max(260, internalUs) *
-        (1 - config.pluginFailureProbability / 100)
-      const reliability = clamp(
-        100 -
-          config.pluginFailureProbability * 6.2 -
-          config.workerFailureProbability * 5.8 -
-          config.exchangeFailureProbability * 2.6 -
-          failurePenalty * 0.5,
-        36,
-        97,
-      )
-      const faultTolerance = clamp(
-        100 - config.pluginFailureProbability * 13 - config.workerFailureProbability * 11,
-        40,
-        96,
-      )
-      const scalability = clamp(
-        78 + config.pluginCount * 1.2 - config.exchangeFeeds * 0.3 + (config.optimizationMode === 'optimized' ? 7 : 0),
-        44,
-        96,
-      )
-      return {
-        internalUs,
-        endToEndUs,
-        throughput,
-        reliability,
-        faultTolerance,
-        scalability,
-        score: clamp(
-          54 + throughput / 2100 + reliability * 0.34 + scalability * 0.3 - endToEndUs / 42,
-          0,
-          100,
-        ),
-      }
-    }
-    case 'layered': {
-      const serializationPenalty = config.layerCount * 30 + config.layerCount * config.eventSizeKb * 6
-      const validationPenalty = config.layerCount * (config.averageProcessingUs * 0.12)
-      const internalUs =
-        config.averageProcessingUs * (1 + config.variabilityPercent / 110) +
-        serializationPenalty +
-        validationPenalty +
-        (config.optimizationMode === 'optimized' ? -34 : 0) +
-        feedPressure * 6 +
-        config.eventSizeKb * 18
-
-      const endToEndUs = internalUs + networkLatency + config.unavailabilityProbability * 7
-      const throughput =
-        (config.workerThreads * 112000) /
-        Math.max(260, internalUs) *
-        (1 - config.unavailabilityProbability / 100)
-      const reliability = clamp(
-        100 -
-          config.exchangeFailureProbability * 2.7 -
-          config.unavailabilityProbability * 5.5 -
-          config.stageFailureProbability * 3.1 -
-          failurePenalty * 0.45,
-        30,
-        96,
-      )
-      const faultTolerance = clamp(
-        100 - config.unavailabilityProbability * 14 - config.workerFailureProbability * 10,
-        35,
-        95,
-      )
-      const scalability = clamp(
-        70 + config.layerCount * 1.7 - config.exchangeFeeds * 0.8 + (config.optimizationMode === 'optimized' ? 18 : 0),
-        40,
-        98,
-      )
-      return {
-        internalUs,
-        endToEndUs,
-        throughput,
-        reliability,
-        faultTolerance,
-        scalability,
-        score: clamp(
-          50 + throughput / 2000 + reliability * 0.32 + scalability * 0.32 - endToEndUs / 46,
-          0,
-          100,
-        ),
-      }
-    }
-    case 'shared': {
-      const contentionPenalty =
-        config.lockContention * 5 +
-        (config.syncMethod === 'mutex' ? 80 : config.syncMethod === 'atomic' ? 40 : 56) +
-        config.workerThreads * 4
-      const internalUs =
-        config.averageProcessingUs * (1 + config.variabilityPercent / 150) +
-        contentionPenalty +
-        feedPressure * 5 +
-        config.eventSizeKb * 26 +
-        12 * burstFactor
-
-      const endToEndUs = internalUs + networkLatency + config.lockContention * 2.6
-      const throughput =
-        (config.workerThreads * 138000) /
-        Math.max(260, internalUs) *
-        (1 - config.lockContention / 220)
-      const reliability = clamp(
-        100 -
-          config.lockContention * 0.8 -
-          config.workerFailureProbability * 4.5 -
-          config.exchangeFailureProbability * 2.3 -
-          failurePenalty * 0.5,
-        32,
-        97,
-      )
-      const faultTolerance = clamp(
-        100 - config.lockContention * 0.9 - config.workerFailureProbability * 13,
-        30,
-        94,
-      )
-      const scalability = clamp(
-        80 + config.workerThreads * 1.1 - config.lockContention * 0.5 - (config.syncMethod === 'mutex' ? 10 : 0),
-        36,
-        96,
-      )
-      return {
-        internalUs,
-        endToEndUs,
-        throughput,
-        reliability,
-        faultTolerance,
-        scalability,
-        score: clamp(
-          49 + throughput / 2050 + reliability * 0.31 + scalability * 0.3 - endToEndUs / 45,
-          0,
-          100,
-        ),
-      }
-    }
-    default:
-      return {
-        internalUs: 0,
-        endToEndUs: 0,
-        throughput: 0,
-        reliability: 0,
-        faultTolerance: 0,
-        scalability: 0,
-        score: 0,
-      }
-  }
-}
+type Config = SimulationConfig
 
 function App() {
   const [config, setConfig] = useState<Config>(defaultConfig)
-  const [simulationRun, setSimulationRun] = useState(1)
+  const [simulationRun, setSimulationRun] = useState(0)
+  const [simulationResult, setSimulationResult] = useState<SimulationRunResult | null>(null)
+  const [isSimulationRunning, setIsSimulationRunning] = useState(false)
+  const [simulationError, setSimulationError] = useState('')
   const [relayReady, setRelayReady] = useState(false)
   const [marketConfigured, setMarketConfigured] = useState(false)
   const [relayError, setRelayError] = useState('')
@@ -365,6 +144,7 @@ function App() {
     tradeCount: 0,
     totalShares: 0,
     eventsPerSecond: 0,
+    averageTradeSize: 0,
   })
   const marketArrivalTimes = useRef<number[]>([])
   const streamStartedAt = useRef(0)
@@ -474,6 +254,9 @@ function App() {
               tradeCount: previous.tradeCount + 1,
               totalShares: previous.totalShares + trade.size,
               eventsPerSecond: arrivals.length / observationSeconds,
+              averageTradeSize:
+                (previous.averageTradeSize * previous.tradeCount + trade.size) /
+                (previous.tradeCount + 1),
             }))
           }
         } catch {
@@ -535,33 +318,52 @@ function App() {
     : config
 
   const runSimulation = () => {
-    setSimulationRun((value) => value + 1)
+    if (isSimulationRunning) return
+
+    const runNumber = simulationRun + 1
+    const runConfig: Config = {
+      ...simulationConfig,
+      selectedArchitectures: { ...simulationConfig.selectedArchitectures },
+    }
+    const selected = architectureIds.filter(
+      (architecture) => runConfig.selectedArchitectures[architecture],
+    )
+    const marketSamples: MarketTradeSample[] = liveWorkloadActive
+      ? liveTrades.map(({ symbol, price, size }) => ({ symbol, price, size }))
+      : []
+
+    setSimulationRun(runNumber)
+    setIsSimulationRunning(true)
+    setSimulationError('')
+    window.setTimeout(() => {
+      try {
+        setSimulationResult(
+          simulateArchitectures(runConfig, selected, marketSamples, runNumber),
+        )
+      } catch (error) {
+        setSimulationError(
+          error instanceof Error ? error.message : 'The simulation could not be completed.',
+        )
+      } finally {
+        setIsSimulationRunning(false)
+      }
+    }, 25)
   }
 
-  const architectureResults = (() => {
-    const selected = architectureIds.filter((architecture) => simulationConfig.selectedArchitectures[architecture])
-
-    if (selected.length === 0) {
-      return architectureIds.map((architecture) => ({
-        architecture,
-        ...computeArchitectureMetrics(simulationConfig, architecture, simulationRun),
-      }))
-    }
-
-    return selected.map((architecture) => ({
-      architecture,
-      ...computeArchitectureMetrics(simulationConfig, architecture, simulationRun),
-    }))
-  })()
-
+  const architectureResults = simulationResult?.architectures ?? []
   const sortedResults = [...architectureResults].sort((a, b) => b.score - a.score)
   const winner = sortedResults[0]
-  const targetPassed = architectureResults.filter((result) => result.endToEndUs < 1000).length
+  const targetPassed = architectureResults.filter(
+    (result) =>
+      result.endToEndP99Us < 1000 &&
+      result.throughputOrdersPerSecond >= (simulationResult?.orderRequestsPerSecond ?? 0) * 0.95 &&
+      result.reliability >= 95,
+  ).length
   const latencyChart = architectureResults.map((result) => ({
     architecture: architectureMeta[result.architecture].short,
-    latencyUs: Math.round(result.endToEndUs),
-    internalUs: Math.round(result.internalUs),
-    throughputK: Math.round(result.throughput / 1000),
+    latencyUs: Math.round(result.endToEndP99Us),
+    internalUs: Math.round(result.internalP99Us),
+    throughputK: Math.round(result.throughputOrdersPerSecond / 1000),
     reliability: Math.round(result.reliability),
   }))
 
@@ -570,13 +372,19 @@ function App() {
   }
 
   const toggleArchitecture = (architecture: ArchitectureId) => {
-    setConfig((previous) => ({
-      ...previous,
-      selectedArchitectures: {
-        ...previous.selectedArchitectures,
-        [architecture]: !previous.selectedArchitectures[architecture],
-      },
-    }))
+    setConfig((previous) => {
+      const selectedCount = Object.values(previous.selectedArchitectures).filter(Boolean).length
+      if (previous.selectedArchitectures[architecture] && selectedCount === 1) {
+        return previous
+      }
+      return {
+        ...previous,
+        selectedArchitectures: {
+          ...previous.selectedArchitectures,
+          [architecture]: !previous.selectedArchitectures[architecture],
+        },
+      }
+    })
   }
 
   return (
@@ -588,8 +396,13 @@ function App() {
         </div>
         <div className="header-actions">
           <span className="status-pill">Target latency: &lt; 1000 µs</span>
-          <button type="button" className="primary-button" onClick={runSimulation}>
-            Run simulation
+          <button
+            type="button"
+            className="primary-button"
+            onClick={runSimulation}
+            disabled={isSimulationRunning}
+          >
+            {isSimulationRunning ? 'Simulating…' : 'Run simulation'}
           </button>
         </div>
       </header>
@@ -656,6 +469,15 @@ function App() {
               suffix="µs"
             />
             <SliderField
+              label="Processing variability"
+              value={config.variabilityPercent}
+              min={0}
+              max={100}
+              step={1}
+              onChange={(value) => updateConfig('variabilityPercent', value)}
+              suffix="%"
+            />
+            <SliderField
               label="Volatility"
               value={config.volatility}
               min={0}
@@ -687,6 +509,7 @@ function App() {
                       ? 'toggle-chip active'
                       : 'toggle-chip'
                   }
+                  aria-pressed={config.selectedArchitectures[architecture]}
                   onClick={() => toggleArchitecture(architecture)}
                 >
                   {architectureMeta[architecture].short}
@@ -718,6 +541,24 @@ function App() {
               onChange={(value) => updateConfig('pluginCount', value)}
             />
             <SliderField
+              label="Plugin dispatch overhead"
+              value={config.pluginOverheadUs}
+              min={0}
+              max={200}
+              step={2}
+              onChange={(value) => updateConfig('pluginOverheadUs', value)}
+              suffix="µs"
+            />
+            <SliderField
+              label="Plugin isolation"
+              value={config.pluginIsolation}
+              min={0}
+              max={100}
+              step={1}
+              onChange={(value) => updateConfig('pluginIsolation', value)}
+              suffix="%"
+            />
+            <SliderField
               label="Layer count"
               value={config.layerCount}
               min={2}
@@ -734,6 +575,34 @@ function App() {
               onChange={(value) => updateConfig('lockContention', value)}
               suffix="%"
             />
+            <label className="select-field">
+              <span>Shared-state synchronization</span>
+              <select
+                value={config.syncMethod}
+                onChange={(event) =>
+                  updateConfig('syncMethod', event.target.value as Config['syncMethod'])
+                }
+              >
+                <option value="mutex">Mutex</option>
+                <option value="atomic">Atomic</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+            </label>
+            <label className="select-field">
+              <span>Layer call path</span>
+              <select
+                value={config.optimizationMode}
+                onChange={(event) =>
+                  updateConfig(
+                    'optimizationMode',
+                    event.target.value as Config['optimizationMode'],
+                  )
+                }
+              >
+                <option value="optimized">Optimized internal calls</option>
+                <option value="baseline">Baseline serialization</option>
+              </select>
+            </label>
           </div>
 
           <div className="control-group">
@@ -755,6 +624,24 @@ function App() {
               step={2}
               onChange={(value) => updateConfig('networkJitterUs', value)}
               suffix="µs"
+            />
+            <SliderField
+              label="Acknowledgment delay"
+              value={config.ackDelayUs}
+              min={0}
+              max={300}
+              step={5}
+              onChange={(value) => updateConfig('ackDelayUs', value)}
+              suffix="µs"
+            />
+            <SliderField
+              label="Packet loss"
+              value={config.packetLossPercent}
+              min={0}
+              max={10}
+              step={0.1}
+              onChange={(value) => updateConfig('packetLossPercent', value)}
+              suffix="%"
             />
             <SliderField
               label="Exchange failure"
@@ -783,16 +670,130 @@ function App() {
               onChange={(value) => updateConfig('pluginFailureProbability', value)}
               suffix="%"
             />
+            <SliderField
+              label="Processing-stage failure"
+              value={config.stageFailureProbability}
+              min={0}
+              max={10}
+              step={0.1}
+              onChange={(value) => updateConfig('stageFailureProbability', value)}
+              suffix="%"
+            />
+            <SliderField
+              label="Worker failure"
+              value={config.workerFailureProbability}
+              min={0}
+              max={10}
+              step={0.1}
+              onChange={(value) => updateConfig('workerFailureProbability', value)}
+              suffix="%"
+            />
+            <SliderField
+              label="Feed disconnect"
+              value={config.feedDisconnectProbability}
+              min={0}
+              max={10}
+              step={0.1}
+              onChange={(value) => updateConfig('feedDisconnectProbability', value)}
+              suffix="%"
+            />
+            <SliderField
+              label="Exchange unavailability"
+              value={config.unavailabilityProbability}
+              min={0}
+              max={10}
+              step={0.1}
+              onChange={(value) => updateConfig('unavailabilityProbability', value)}
+              suffix="%"
+            />
           </div>
         </aside>
 
         <section className="content-panel">
           <div className="metric-grid">
-            <MetricCard icon={<Gauge size={18} />} label="Best score" value={`${winner.score.toFixed(1)}/100`} tone="emerald" />
-            <MetricCard icon={<TimerReset size={18} />} label="End-to-end latency" value={`${winner.endToEndUs.toFixed(0)} µs`} tone="amber" />
-            <MetricCard icon={<BarChart3 size={18} />} label="Throughput" value={`${(winner.throughput / 1000).toFixed(0)}k evt/s`} tone="violet" />
-            <MetricCard icon={<ShieldCheck size={18} />} label="Target pass" value={`${targetPassed}/${architectureResults.length}`} tone="rose" />
+            <MetricCard icon={<Gauge size={18} />} label="Best score" value={winner ? `${winner.score.toFixed(1)}/100` : '—'} tone="emerald" />
+            <MetricCard icon={<TimerReset size={18} />} label="E2E p99 latency" value={winner ? `${winner.endToEndP99Us.toFixed(0)} µs` : '—'} tone="amber" />
+            <MetricCard icon={<BarChart3 size={18} />} label="Order throughput" value={winner ? `${(winner.throughputOrdersPerSecond / 1000).toFixed(1)}k ord/s` : '—'} tone="violet" />
+            <MetricCard icon={<ShieldCheck size={18} />} label="SLO pass" value={simulationResult ? `${targetPassed}/${architectureResults.length}` : '—'} tone="rose" />
           </div>
+
+          {simulationError && (
+            <div className="simulation-error" role="alert">
+              Simulation failed: {simulationError}
+            </div>
+          )}
+
+          {simulationResult ? (
+            <section className="simulation-report panel" aria-live="polite">
+              <div className="simulation-report-header">
+                <div>
+                  <p className="eyebrow">Simulation run #{simulationResult.runNumber}</p>
+                  <h2>Evaluation results</h2>
+                </div>
+                <span className="run-stamp">
+                  Seed {simulationResult.seed} · {simulationResult.elapsedMs.toFixed(1)} ms compute
+                </span>
+              </div>
+              <div className="run-facts">
+                <span><strong>{simulationResult.sampledEvents.toLocaleString()}</strong> representative events processed</span>
+                <span><strong>{simulationResult.sampledOrders.toLocaleString()}</strong> sampled order requests</span>
+                <span><strong>{simulationResult.projectedEvents.toLocaleString()}</strong> events projected over {simulationResult.durationSeconds}s</span>
+                <span><strong>{simulationResult.projectedOrders.toLocaleString()}</strong> projected order requests</span>
+                <span>
+                  <strong>{simulationResult.liveTradeSamples}</strong> live trades
+                  {simulationResult.liveTradeSamples > 0
+                    ? ` · ${simulationResult.liveMeanTradeSize.toFixed(1)} avg shares · ${simulationResult.liveVolatilityPercent.toFixed(3)}% observed move`
+                    : ''}
+                </span>
+                <span>
+                  Input rates: <strong>{simulationResult.marketEventsPerSecond.toFixed(1)} market/s</strong>
+                  {' · '}
+                  <strong>{simulationResult.orderRequestsPerSecond.toLocaleString()} orders/s</strong>
+                </span>
+              </div>
+              {winner && (
+                <div className="best-solution">
+                  <div className="best-solution-heading">
+                    <span className="best-solution-kicker">
+                      {targetPassed > 0
+                        ? 'Best solution meeting modeled SLOs'
+                        : 'Highest-scoring available solution'}
+                    </span>
+                    <strong>{architectureMeta[winner.architecture].label}</strong>
+                    <span className="score-badge">{winner.score.toFixed(1)} / 100</span>
+                  </div>
+                  <p>
+                    {targetPassed > 0
+                      ? 'This candidate met the modeled p99 latency, order-throughput, and completion-rate thresholds.'
+                      : 'No evaluated candidate meets all modeled SLOs (p99 < 1 ms, at least 95% of requested order throughput, and at least 95% successful completion). This is the best score among the selected architectures, not a claim that the target is met.'}
+                  </p>
+                  <div className="winner-outcomes">
+                    <span>p99 latency <strong>{winner.endToEndP99Us.toFixed(0)} µs</strong></span>
+                    <span>Success rate <strong>{winner.reliability.toFixed(1)}%</strong></span>
+                    <span>Estimated orders completed <strong>{winner.projectedCompletedOrders.toLocaleString()} / {winner.projectedOrders.toLocaleString()}</strong></span>
+                    <span>Modeled capacity <strong>{Math.round(winner.capacityOrdersPerSecond).toLocaleString()} ord/s</strong></span>
+                  </div>
+                  <p className="run-losses">
+                    In this sample: {winner.rejectedOrders.toLocaleString()} orders rejected, {winner.queueDrops.toLocaleString()} queue drops, {winner.internalFailures.toLocaleString()} internal fault events, and {winner.marketEventsDropped.toLocaleString()} feed events lost.
+                  </p>
+                  <p className="bottleneck-note"><strong>Primary bottleneck:</strong> {winner.bottleneck}</p>
+                </div>
+              )}
+              <p className="simulation-caveat">
+                Reproducible statistical model, not a hardware benchmark or measured execution. Results use the settings and live market snapshot captured when this run started.
+              </p>
+            </section>
+          ) : (
+            <section className="simulation-report panel run-prompt" aria-live="polite">
+              <h2>{isSimulationRunning ? 'Running event simulation…' : 'Ready to evaluate'}</h2>
+              <p>
+                {isSimulationRunning
+                  ? 'Processing a representative workload through the selected architecture models.'
+                  : 'Set the workload and fault parameters, then run the simulation to process a reproducible event sample and rank the selected architectures.'}
+              </p>
+              <p>Each run evaluates queue waits, stage processing, network retries, injected faults, p99 latency, completion rate, and modeled capacity.</p>
+            </section>
+          )}
 
           <section className="live-feed-panel panel">
             <div className="live-feed-header">
@@ -831,7 +832,12 @@ function App() {
                       setMarketMessage('Stream stopped.')
                     } else {
                       setLiveTrades([])
-                      setMarketStats({ tradeCount: 0, totalShares: 0, eventsPerSecond: 0 })
+                      setMarketStats({
+                        tradeCount: 0,
+                        totalShares: 0,
+                        eventsPerSecond: 0,
+                        averageTradeSize: 0,
+                      })
                       marketArrivalTimes.current = []
                       setIsStreaming(true)
                     }
@@ -898,8 +904,8 @@ function App() {
           <div className="chart-grid">
             <div className="chart-box panel">
               <div className="chart-title-row">
-                <h3>Latency comparison</h3>
-                <span>Internal + e2e latency</span>
+                <h3>P99 latency comparison</h3>
+                <span>Successful orders · microseconds</span>
               </div>
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={latencyChart}>
@@ -941,21 +947,30 @@ function App() {
           <div className="results-table panel">
             <div className="table-header">
               <h3>Architecture ranking</h3>
-              <span>{sortedResults.length} styles evaluated</span>
+              <span>
+                {simulationResult
+                  ? `${sortedResults.length} styles · ranked by composite score`
+                  : 'Run simulation to rank candidates'}
+              </span>
             </div>
 
             <table>
               <thead>
                 <tr>
                   <th>Architecture</th>
-                  <th>Internal</th>
-                  <th>E2E</th>
-                  <th>Throughput</th>
-                  <th>Reliability</th>
+                  <th>Internal p99</th>
+                  <th>E2E p50</th>
+                  <th>E2E p95</th>
+                  <th>E2E p99</th>
+                  <th>Orders / s</th>
+                  <th>Success</th>
                   <th>Score</th>
                 </tr>
               </thead>
               <tbody>
+                {sortedResults.length === 0 && (
+                  <tr><td colSpan={8} className="empty-tape">Results appear here after a simulation run.</td></tr>
+                )}
                 {sortedResults.map((result) => (
                   <tr key={result.architecture} className={winner.architecture === result.architecture ? 'highlight-row' : ''}>
                     <td>
@@ -964,10 +979,12 @@ function App() {
                         {architectureMeta[result.architecture].label}
                       </div>
                     </td>
-                    <td>{result.internalUs.toFixed(0)} µs</td>
-                    <td>{result.endToEndUs.toFixed(0)} µs</td>
-                    <td>{(result.throughput / 1000).toFixed(0)}k/s</td>
-                    <td>{result.reliability.toFixed(0)}%</td>
+                    <td>{result.internalP99Us.toFixed(0)} µs</td>
+                    <td>{result.endToEndP50Us.toFixed(0)} µs</td>
+                    <td>{result.endToEndP95Us.toFixed(0)} µs</td>
+                    <td>{result.endToEndP99Us.toFixed(0)} µs</td>
+                    <td>{Math.round(result.throughputOrdersPerSecond).toLocaleString()}</td>
+                    <td>{result.reliability.toFixed(1)}%</td>
                     <td>{result.score.toFixed(1)}</td>
                   </tr>
                 ))}
@@ -978,40 +995,30 @@ function App() {
           <div className="insight-panel panel">
             <div className="panel-heading">
               <AlertTriangle size={18} />
-              <h3>Architecture evaluation</h3>
+              <h3>Why this architecture ranked highest</h3>
             </div>
-            <p>
-              {winner.architecture === 'pipe' && (
-                <>The pipe-and-filter model keeps independent feed processing parallel, though queue saturation and backpressure shorten the advantage as burstiness rises.</>
-              )}
-              {winner.architecture === 'microkernel' && (
-                <>The microkernel approach keeps coordination minimal while isolating services, but plugin dispatch overhead becomes the main cost under heavier plugin fan-out.</>
-              )}
-              {winner.architecture === 'layered' && (
-                <>The layered model remains easy to reason about and secure, but repeated validation and serialization across boundaries gradually reduce throughput and increase latency.</>
-              )}
-              {winner.architecture === 'shared' && (
-                <>The shared-memory architecture minimizes inter-component transfer costs and can be very fast when contention stays low, yet mutex pressure and cache churn erode gains once lock intensity spikes.</>
-              )}
-            </p>
-            <div className="summary-list">
-              {sortedResults.map((result) => (
-                <div key={result.architecture} className="summary-item">
-                  <span className="summary-label">{architectureMeta[result.architecture].label}</span>
-                  <span className="summary-value">{result.endToEndUs.toFixed(0)} µs · {result.reliability.toFixed(0)}% reliable</span>
+            {winner ? (
+              <>
+                <p>{architectureMeta[winner.architecture].summary}</p>
+                <div className="summary-list">
+                  {sortedResults.map((result) => (
+                    <div key={result.architecture} className="summary-item">
+                      <span className="summary-label">{architectureMeta[result.architecture].label}</span>
+                      <span className="summary-value">
+                        p50 / p95 / p99 {result.endToEndP50Us.toFixed(0)} / {result.endToEndP95Us.toFixed(0)} / {result.endToEndP99Us.toFixed(0)} µs · {result.reliability.toFixed(1)}% completed · score {result.score.toFixed(1)}
+                      </span>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-            <div className="recommendation">
-              <span>Recommended focus</span>
-              <strong>
-                {winner.architecture === 'pipe' ? 'Keep pipeline parallelism but add adaptive backpressure.' : null}
-                {winner.architecture === 'microkernel' ? 'Reduce plugin dispatch overhead and isolate high-risk plugins.' : null}
-                {winner.architecture === 'layered' ? 'Use an optimized path across hot internal calls.' : null}
-                {winner.architecture === 'shared' ? 'Prefer atomic or hybrid synchronization under heavy contention.' : null}
-              </strong>
-              <ArrowRight size={16} />
-            </div>
+                <div className="recommendation">
+                  <span>Next optimization</span>
+                  <strong>{winner.bottleneck}</strong>
+                  <ArrowRight size={16} />
+                </div>
+              </>
+            ) : (
+              <p>Run the simulator to compare results and get a scenario-specific architecture recommendation.</p>
+            )}
           </div>
         </section>
       </main>
