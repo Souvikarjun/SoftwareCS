@@ -462,6 +462,8 @@ function App() {
               now,
             ]
             marketArrivalTimes.current = arrivals
+            setMarketStatus('connected')
+            setMarketMessage('Live trade stream connected')
             const observationSeconds = Math.max(
               1,
               Math.min(10, (now - streamStartedAt.current) / 1000),
